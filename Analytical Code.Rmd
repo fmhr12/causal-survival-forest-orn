@@ -1,0 +1,465 @@
+```{r}
+# ==============================================================================
+# Title:   Causal Survival Forest Analysis for Osteoradionecrosis (ORN)
+# Purpose: Estimates Heterogeneous Treatment Effects (HTE) of tooth extraction 
+#          prior to radiotherapy using Causal Survival Forests (grf).
+#          Includes strict cross-validation for out-of-sample CATE priorities,
+#   
+# Inputs:  De-identified clinical dataset (.xlsx)
+# Outputs: ATE, CATE distribution, RATE/AUTOC,
+#          TOC curve, calibration plots, overlap diagnostics, BLP.
+# ==============================================================================
+
+# ==============================================================
+# 0. Libraries
+# ==============================================================
+library(grf)            # Causal survival forests + ATE/CATE/RATE/TOC tools
+library(readxl)         # Excel file reading
+library(ggplot2)        # Visualization
+library(dplyr)          # Data manipulation
+library(pbapply)        # Progress bar
+library(caret)          # Stratified fold creation
+
+# ==============================================================
+# 1. Load & Prepare Data
+# ==============================================================
+file_path <- "//path/file.xlsx"
+df    <- read_excel(file_path)
+
+# Define categorical and continuous variables
+cat_vars <- c(
+  "Sex", "ECOG_Merged", "Drinking_History",
+  "TNM_Staging_Merged", "Primary_Treatment_Modality", "Insurance_Type",
+  "Periodontal_Grading_Merged", "HPV",
+  "Disease_Site", "Histological_Diagnosis", "Chemotherapy"
+)
+
+cont_vars <- c(
+  "Age", "DMFS",
+  "Teeth_Number", "RT_Fx",
+  "Duration_RT_Days", "RT_Dose",
+  "Income", "D10cc", "Smoking_Pack_per_Year"
+)
+
+df[cat_vars] <- lapply(df[cat_vars], as.factor)
+
+# ==============================================================
+# 2. Define Outcomes & Feature Matrix
+# ==============================================================
+# Y: Time to event
+# D: Event indicator (1 = ORN, 0 = censored)
+# W: Treatment indicator (1 = extraction, 0 = no extraction)
+Y <- as.numeric(df$ClinRad_Time_Indicator)
+D <- as.numeric(df$ClinRad)
+W <- as.numeric(df$Extraction)
+
+# One-hot encode features 
+fmla <- as.formula(paste("~ 0 +", paste(c(cat_vars, cont_vars), collapse = " + ")))
+X    <- model.matrix(fmla, data = df)
+
+# ==============================================================
+# 3. Repeated k-fold Cross-Validation Settings
+# ==============================================================
+n        <- nrow(X)
+horizon  <- 60               # RMST horizon (months)
+k        <- 5                # folds
+R        <- 100               # repetitions 
+n_folds  <- k * R
+q_grid   <- seq(0.1, 1, 0.1) 
+
+set.seed(123)
+cv_pairs <- vector("list", n_folds)
+ctr      <- 1
+
+# Fold stratification
+for (rep in seq_len(R)) {
+  folds <- createFolds(D, k = k)
+  for (f in seq_along(folds)) {
+    te <- folds[[f]]
+    tr <- setdiff(seq_len(n), te)
+    cv_pairs[[ctr]] <- list(train = tr, test = te)
+    ctr <- ctr + 1
+  }
+}
+
+# ==============================================================
+# 4. Main Cross-Fitting Loop (Strict Train/Test Separation)
+# ==============================================================
+res_list <- pblapply(seq_len(n_folds), function(b) {
+  tr <- cv_pairs[[b]]$train
+  te <- cv_pairs[[b]]$test
+  
+  # ── Step A: Train forest on TRAIN ─────────────────────────────────────────
+  cs_train <- causal_survival_forest(
+    X[tr, ], Y[tr], W[tr], D[tr],
+    target          = "RMST",
+    horizon         = horizon,
+    num.trees       = 2000,
+    honesty         = TRUE,
+    tune.parameters = "all"
+  )
+  
+  # ── Step B: Out-of-fold priorities on TEST (predicted CATE) ───────────────
+  tau_pred_te <- predict(cs_train, newdata = X[te, ])$predictions
+  
+  # Save out-of-fold priorities in a length-n vector
+  priority_fold <- rep(NA_real_, n)
+  priority_fold[te] <- tau_pred_te
+  
+  # Also store CATE predictions for later descriptive analysis
+  tau_fold <- rep(NA_real_, n)
+  tau_fold[te] <- tau_pred_te
+  
+  # ── Step C: Evaluation forest on TEST to compute DR/AIPW scores ───────────
+  cs_eval <- causal_survival_forest(
+    X[te, ], Y[te], W[te], D[te],
+    target          = "RMST",
+    horizon         = horizon,
+    num.trees       = 2000,
+    honesty         = TRUE,
+    tune.parameters = "all"
+  )
+  
+  # DR/AIPW pseudo-outcomes for TEST subjects
+  dr_te <- get_scores(cs_eval)
+  
+  # Save out-of-fold DR scores in a length-n vector
+  dr_fold <- rep(NA_real_, n)
+  dr_fold[te] <- dr_te
+  
+  # ── Step D: Calibration summarization on TEST──────
+  qcuts_cal <- quantile(tau_pred_te, probs = seq(0, 1, 0.25), na.rm = TRUE)
+  qlabs     <- sprintf("Q%d", 1:4)
+  
+  if (length(unique(qcuts_cal)) < 5) {
+    qt_cal <- as.factor(rep(NA, length(tau_pred_te)))
+  } else {
+    qt_cal <- cut(
+      tau_pred_te,
+      breaks         = qcuts_cal,
+      include.lowest = TRUE,
+      labels         = qlabs
+    )
+  }
+  
+  cal_rows <- data.frame(
+    Fold     = b,
+    Quartile = qt_cal,
+    pred     = tau_pred_te,
+    obs      = dr_te
+  ) |>
+    group_by(Fold, Quartile) |>
+    summarise(
+      pred_mean = mean(pred, na.rm = TRUE),
+      obs_mean  = mean(obs,  na.rm = TRUE),
+      .groups   = "drop"
+    )
+  
+  list(
+    tau       = tau_fold,
+    priority  = priority_fold,
+    dr        = dr_fold,
+    quart_cal = cal_rows
+  )
+})
+
+# ==============================================================
+# 5. Aggregate Cross-Fitted Quantities
+# ==============================================================
+#  (a) CATE: aggregate patient-level out-of-fold CATEs across CV repetitions
+tau_mat     <- sapply(res_list, `[[`, "tau")       # n x n_folds
+tau_hat_avg <- rowMeans(tau_mat, na.rm = TRUE)
+
+# (b) RATE/TOC inputs:
+#     Aggregate to ONE priority and ONE DR score per patient across repeats.
+priority_mat <- sapply(res_list, `[[`, "priority") # n x n_folds
+dr_mat       <- sapply(res_list, `[[`, "dr")       # n x n_folds
+
+priority_bar <- rowMeans(priority_mat, na.rm = TRUE)
+dr_bar       <- rowMeans(dr_mat,       na.rm = TRUE)
+
+# Calibration rows (descriptive)
+cal_boot <- bind_rows(lapply(res_list, `[[`, "quart_cal"))
+
+# ==============================================================
+# 6. RATE / TOC Inference 
+# ==============================================================
+rate_fit <- rank_average_treatment_effect.fit(
+  DR.scores  = dr_bar,
+  priorities = priority_bar,
+  target     = "AUTOC",  # AUTOC = area under the TOC (i.e., RATE)
+  q          = q_grid,
+  R          = 2000      # bootstrap reps used internally to estimate std.err
+)
+
+rate_est <- rate_fit$estimate
+rate_se  <- rate_fit$std.err
+rate_ci  <- rate_est + c(-1.96, 1.96) * rate_se
+
+cat("\n--- RATE / AUTOC (Cross-fitted DR scores + priorities; .fit bootstrap SE) ---\n")
+cat(sprintf("Estimate = %.4f, SE = %.4f, 95%% CI = [%.4f, %.4f]\n",
+            rate_est, rate_se, rate_ci[1], rate_ci[2]))
+
+# ==============================================================
+# 7. Visualization
+# ==============================================================
+# (a) CATE Histogram by Quartile (descriptive)
+qcuts_cate <- quantile(tau_hat_avg, probs = seq(0, 1, 0.25), na.rm = TRUE)
+df_tau <- data.frame(tau_hat = tau_hat_avg)
+
+df_tau$Quartile <- cut(
+  df_tau$tau_hat,
+  breaks         = qcuts_cate,
+  include.lowest = TRUE,
+  labels         = paste0("Q", 1:4)
+)
+
+ggplot(df_tau, aes(x = tau_hat, fill = Quartile)) +
+  geom_histogram(bins = 40, position = "identity", alpha = 0.6) +
+  labs(
+    title = "Histogram of Predicted CATE by Quartile",
+    x     = expression("CATE (" * hat(tau) * ") (months)"),
+    y     = "Count"
+  ) +
+  scale_fill_brewer(palette = "Set2") +
+  theme_minimal()
+
+# (b) Calibration Plot: Predicted vs Observed (descriptive)
+ggplot(cal_boot, aes(obs_mean, pred_mean, colour = Quartile)) +
+  geom_vline(xintercept = 0, linetype = "dashed") +
+  geom_point(alpha = 0.5, size = 1.5) +
+  scale_color_brewer(palette = "Set2") +
+  labs(
+    title  = "Calibration: Predicted vs Pseudo-Observed (AIPW) RMST Difference",
+    x      = "Observed Mean AIPW scores (months)",
+    y      = "Predicted Mean CATE (months)"
+  ) +
+  theme_minimal()
+
+# (c) Boxplot of Observed DR/AIPW Scores by Predicted Quartile (descriptive)
+cal_long <- cal_boot |>
+  filter(!is.na(Quartile)) |>
+  select(Quartile, obs_mean)
+
+ggplot(cal_long, aes(Quartile, obs_mean, fill = Quartile)) +
+  geom_boxplot(width = 0.6, alpha = 0.8, outlier.shape = NA) +
+  scale_fill_brewer(palette = "Set2") +
+  labs(
+    title = "Pseudo-Observed (AIPW) by Predicted CATE Quartile",
+    y     = "Mean observed AIPW score (months)"
+  ) +
+  theme_minimal()
+
+# (d) TOC Curve 
+toc_df <- rate_fit$TOC
+
+plot_df <- data.frame(
+  q     = toc_df$q,
+  mean  = toc_df$estimate,
+  lower = toc_df$estimate - 1.96 * toc_df$std.err,
+  upper = toc_df$estimate + 1.96 * toc_df$std.err
+)
+
+ggplot(plot_df, aes(q, mean)) +
+  geom_ribbon(aes(ymin = lower, ymax = upper), alpha = 0.2) +
+  geom_line(size = 1) +
+  labs(
+    x     = "Treatment proportion q",
+    y     = "Incremental RMST gain (months)",
+    title = "Targeting Operator Characteristic (TOC)"
+  ) +
+  theme_minimal()
+
+# ==============================================================
+# 8. Covariate-Comparison Table (mean (sd); count (%))
+# ==============================================================
+## 1. Helper functions -----------------------------------------
+mean_sd_fmt <- function(x) {                
+  x <- x[!is.na(x)]
+  if (length(x) < 2) return(NA_character_)
+  sprintf("%.2f (%.2f)", mean(x), sd(x))
+}
+
+count_pct_fmt <- function(logical_vec, n_group) {
+  # logical_vec must be TRUE/FALSE for membership of the level
+  cnt <- sum(logical_vec, na.rm = TRUE)
+  pct <- 100 * cnt / n_group
+  sprintf("%d (%.1f%%)", cnt, pct)
+}
+
+## 2. Define Grouping: Full Sample + Quartiles of avg CATE ----
+# Ensure tau_hat_avg (calculated in Section 5) is available
+labels   <- c("Full Sample", paste0("Q", 1:4))
+qfac_all <- cut(
+  tau_hat_avg,
+  breaks         = quantile(tau_hat_avg, probs = seq(0, 1, 0.25), na.rm = TRUE),
+  include.lowest = TRUE,
+  labels         = paste0("Q", 1:4)
+)
+
+group_index <- c(
+  list("Full Sample" = rep(TRUE, length(tau_hat_avg))),
+  setNames(
+    lapply(levels(qfac_all), function(q) qfac_all == q),
+    levels(qfac_all)
+  )
+)
+
+## 3. Build Table ---------------------------------------------
+rows <- list()
+
+# (1) Categorical Variables
+for (v in cat_vars) {
+  # Ensure the column is a factor (it should be from Section 1)
+  lvls <- levels(df[[v]])
+  for (lvl in lvls) {
+    key <- paste0(v, " = ", lvl)
+    rows[[key]] <- sapply(group_index, function(idx) {
+      n_group <- sum(idx)
+      # Check exact match for the level
+      count_pct_fmt(df[[v]][idx] == lvl, n_group)
+    })
+  }
+}
+
+# (2) Continuous Variables
+for (v in cont_vars) {
+  rows[[v]] <- sapply(group_index, function(idx) {
+    mean_sd_fmt(df[[v]][idx])
+  })
+}
+
+comparison_df <- data.frame(
+  Variable    = names(rows),
+  do.call(rbind, rows),
+  check.names = FALSE
+)
+
+# Print table
+knitr::kable(
+  comparison_df,
+  col.names = c("Variable", labels),
+  caption   = "Baseline covariate distribution across predicted CATE quartiles"
+)
+
+# ==============================================================
+# 9. ATE Inference
+# ==============================================================
+cs_full <- causal_survival_forest(
+  X, Y, W, D,
+  target          = "RMST",
+  horizon         = horizon,
+  num.trees       = 2000,
+  honesty         = TRUE,
+  tune.parameters = "all",
+  seed            = 123
+)
+
+ate_full <- average_treatment_effect(cs_full)
+ate_est  <- ate_full["estimate"]
+ate_se   <- ate_full["std.err"]
+ate_ci   <- ate_est + c(-1.96, 1.96) * ate_se
+
+cat("\n--- ATE (Full-sample CSF) ---\n")
+cat(sprintf("Estimate = %.4f, SE = %.4f, 95%% CI = [%.4f, %.4f]\n",
+            ate_est, ate_se, ate_ci[1], ate_ci[2]))
+
+# ==============================================================
+# 10. DIAGNOSTIC: Propensity Score Overlap Check
+# ==============================================================
+cat("\n--- DIAGNOSTIC: Training Propensity Forest for Overlap Check ---\n")
+ps_forest <- regression_forest(X, W, tune.parameters = "all")
+W_hat     <- predict(ps_forest)$predictions
+
+prop_summary <- data.frame(
+  min     = min(W_hat, na.rm = TRUE),
+  mean    = mean(W_hat, na.rm = TRUE),
+  median  = median(W_hat, na.rm = TRUE),
+  max     = max(W_hat, na.rm = TRUE)
+)
+print(prop_summary)
+
+df_ps <- data.frame(
+  ps    = W_hat,
+  Group = factor(W, levels = c(0, 1), labels = c("Untreated", "Treated"))
+)
+
+ggplot(df_ps, aes(x = ps, fill = Group)) +
+  geom_histogram(position = "identity", alpha = 0.5, bins = 30) +
+  labs(
+    title = "Distribution of Estimated Propensity Scores",
+    x     = expression("Estimated propensity score " * P(W==1~"|"~X)),
+    y     = "Count",
+    fill  = "Group"
+  ) +
+  theme_minimal()
+
+# ==============================================================
+# 11. Best Linear Projection (BLP) on Full Dataset
+# ==============================================================
+# Uses the same cs_full fit used for ATE inference (full-sample forest).
+fmla_blp <- as.formula(paste("~", paste(c(cat_vars, cont_vars), collapse = " + ")))
+design   <- model.matrix(fmla_blp, data = df)
+
+full_blp <- best_linear_projection(
+  cs_full,
+  A             = design,
+  target.sample = "all"
+)
+
+# Extract and format results
+blp_df <- data.frame(
+  Term     = rownames(full_blp),
+  Estimate = full_blp[, "Estimate"],
+  StdError = full_blp[, "Std. Error"],
+  p_value  = full_blp[, "Pr(>|t|)"],
+  CI_lower = full_blp[, "Estimate"] - 1.96 * full_blp[, "Std. Error"],
+  CI_upper = full_blp[, "Estimate"] + 1.96 * full_blp[, "Std. Error"],
+  stringsAsFactors = FALSE
+)
+
+# Tag parent variable for grouping
+blp_df <- blp_df %>%
+  mutate(
+    var_name = sapply(Term, function(t) {
+      if (t == "(Intercept)") return("(Intercept)")
+      if (t %in% cont_vars) return(t)
+      hits <- cat_vars[sapply(cat_vars, function(cv) grepl(paste0("^", cv), t))]
+      if (length(hits) >= 1) return(hits[1]) else return(NA_character_)
+    })
+  )
+
+# Add reference levels (display only)
+reference_levels <- sapply(df[cat_vars], function(x) levels(x)[1])
+baseline_df <- data.frame(
+  Term      = as.character(reference_levels),
+  Estimate  = NA_real_,
+  StdError  = NA_real_,
+  p_value   = NA_real_,
+  CI_lower  = NA_real_,
+  CI_upper  = NA_real_,
+  var_name  = names(reference_levels),
+  stringsAsFactors = FALSE
+)
+
+var_order <- c("(Intercept)", cat_vars, cont_vars)
+
+blp_print_df <- bind_rows(blp_df, baseline_df) %>%
+  mutate(var_name = factor(var_name, levels = var_order)) %>%
+  arrange(
+    var_name,
+    desc(is.na(p_value)),
+    p_value
+  ) %>%
+  select(-var_name)
+
+knitr::kable(
+  blp_print_df,
+  digits    = c(NA, 2, 2, 4, 2, 2),
+  col.names = c("Term", "Estimate", "Std. Error", "p-value", "CI 2.5%", "CI 97.5%"),
+  caption   = "Best Linear Projection on the Full Dataset"
+)
+```
+
+
+
