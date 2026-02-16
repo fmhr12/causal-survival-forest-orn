@@ -1,4 +1,3 @@
-```{r}
 # ==============================================================================
 # Title:   Causal Survival Forest Analysis for Osteoradionecrosis (ORN)
 # Purpose: Estimates Heterogeneous Treatment Effects (HTE) of tooth extraction 
@@ -459,7 +458,7 @@ knitr::kable(
   col.names = c("Term", "Estimate", "Std. Error", "p-value", "CI 2.5%", "CI 97.5%"),
   caption   = "Best Linear Projection on the Full Dataset"
 )
-```
+
 
 
 
